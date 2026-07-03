@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 
 mod dml_planning;
+mod merge_planning;
 mod provider_filter_pushdown;
 mod statistics;
 
