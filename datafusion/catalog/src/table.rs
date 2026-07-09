@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::session::Session;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion_common::{Constraints, Statistics, not_impl_err};
+use datafusion_common::{Constraints, DFSchemaRef, Statistics, TableReference, not_impl_err};
 use datafusion_common::{Result, internal_err};
 use datafusion_expr::Expr;
 use datafusion_expr::statistics::StatisticsRequest;
@@ -382,15 +382,23 @@ pub trait TableProvider: Any + Debug + Sync + Send {
 
     /// Merge rows from a source into this table.
     ///
-    /// The `source` is an [`ExecutionPlan`] representing the USING clause.
+    /// The `source` is an [`ExecutionPlan`] representing the USING clause and
+    /// `source_schema` its logical schema — the qualifiers there are what the
+    /// `on`/`clauses` expressions reference for source columns. `target_ref`
+    /// is the table reference qualifying target-column references. Providers
+    /// need both to resolve expressions such as `t.id = s.id` against a
+    /// combined target/source schema.
     /// The `on` condition is the join predicate from the ON clause.
     /// The `clauses` describe the WHEN MATCHED / WHEN NOT MATCHED actions.
     ///
     /// Returns an [`ExecutionPlan`] producing a single row with `count` (UInt64).
+    #[allow(clippy::too_many_arguments)]
     async fn merge_into(
         &self,
         _state: &dyn Session,
         _source: Arc<dyn ExecutionPlan>,
+        _source_schema: DFSchemaRef,
+        _target_ref: TableReference,
         _on: Expr,
         _clauses: Vec<MergeIntoClause>,
     ) -> Result<Arc<dyn ExecutionPlan>> {

@@ -29,6 +29,7 @@ use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::Expr;
 use datafusion_catalog::Session;
+use datafusion_common::{DFSchemaRef, TableReference};
 use datafusion_expr::dml::{MergeIntoAction, MergeIntoClause, MergeIntoClauseKind};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::empty::EmptyExec;
@@ -37,6 +38,8 @@ use datafusion_physical_plan::empty::EmptyExec;
 #[derive(Clone)]
 struct CapturedMerge {
     source_schema: SchemaRef,
+    source_df_schema: DFSchemaRef,
+    target_ref: TableReference,
     on: Expr,
     clauses: Vec<MergeIntoClause>,
 }
@@ -92,11 +95,15 @@ impl TableProvider for CaptureMergeProvider {
         &self,
         _state: &dyn Session,
         source: Arc<dyn ExecutionPlan>,
+        source_schema: DFSchemaRef,
+        target_ref: TableReference,
         on: Expr,
         clauses: Vec<MergeIntoClause>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         *self.received.lock().unwrap() = Some(CapturedMerge {
             source_schema: source.schema(),
+            source_df_schema: source_schema,
+            target_ref,
             on,
             clauses,
         });
@@ -184,6 +191,13 @@ async fn merge_into_hook_receives_on_and_clauses() -> Result<()> {
     ));
     // The planned source is the bare table: its schema is the batch schema.
     assert_eq!(captured.source_schema.fields().len(), 4);
+    // The logical source schema carries the USING alias as qualifier, and the
+    // target reference is the canonical registered name.
+    assert_eq!(
+        captured.source_df_schema.qualified_field(0).0,
+        Some(&TableReference::bare("s"))
+    );
+    assert_eq!(captured.target_ref, TableReference::bare("t"));
     Ok(())
 }
 

@@ -928,6 +928,7 @@ impl DefaultPhysicalPlanner {
                 table_name,
                 target,
                 op: WriteOp::MergeInto(merge_op),
+                input,
                 ..
             }) => {
                 let provider = source_as_provider(target)?;
@@ -936,6 +937,8 @@ impl DefaultPhysicalPlanner {
                     .merge_into(
                         session_state,
                         input_exec,
+                        Arc::clone(input.schema()),
+                        table_name.clone(),
                         merge_op.on.clone(),
                         merge_op.clauses.clone(),
                     )
