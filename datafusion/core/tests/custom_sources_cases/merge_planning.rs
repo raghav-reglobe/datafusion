@@ -226,11 +226,15 @@ async fn merge_into_subquery_source_with_window_functions() -> Result<()> {
         "t.id = s.id AND t._valid_from = s._valid_from AND t._cdc_offset = s._cdc_offset"
     );
 
-    // Clause predicate + column-subset UPDATE.
+    // Clause predicate + column-subset UPDATE. The analyzer coerces the
+    // predicate literal to ROW_NUMBER's UInt64 (name-preserved via alias).
     assert_eq!(captured.clauses.len(), 2);
     assert_eq!(
-        captured.clauses[0].predicate.as_ref().map(|p| p.to_string()),
-        Some("s.rn = Int64(1)".to_string())
+        captured.clauses[0]
+            .predicate
+            .as_ref()
+            .map(|p| p.clone().unalias_nested().data.to_string()),
+        Some("s.rn = UInt64(1)".to_string())
     );
     assert!(matches!(
         &captured.clauses[0].action,
@@ -249,18 +253,17 @@ async fn merge_into_subquery_source_with_window_functions() -> Result<()> {
 async fn merge_into_returns_count_schema() -> Result<()> {
     let (ctx, provider) = setup(target_schema());
 
-    let batches = ctx
+    let df = ctx
         .sql(
             "MERGE INTO t USING batch s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET val = s.val",
         )
-        .await?
-        .collect()
         .await?;
 
-    assert!(provider.captured().is_some());
     // The DML output is the standard single count column.
-    assert_eq!(batches[0].schema().field(0).name(), "count");
+    assert_eq!(df.schema().field(0).name(), "count");
+    df.collect().await?;
+    assert!(provider.captured().is_some());
     Ok(())
 }
 
@@ -280,5 +283,26 @@ async fn merge_into_source_only_on_probe() -> Result<()> {
     .await?;
 
     assert!(provider.captured().is_some());
+    Ok(())
+}
+
+/// Target-alias form: alias-qualified column references are rewritten to the
+/// canonical table reference at planning time, so the recorded plan is
+/// self-describing (the alias exists only in the SQL text).
+#[tokio::test]
+async fn merge_into_target_alias_normalized() -> Result<()> {
+    let (ctx, provider) = setup(target_schema());
+
+    ctx.sql(
+        "MERGE INTO t AS tgt USING batch s ON tgt.id = s.id \
+         WHEN MATCHED THEN UPDATE SET val = s.val \
+         WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    let captured = provider.captured().expect("merge_into was not invoked");
+    assert_eq!(captured.on.to_string(), "t.id = s.id");
     Ok(())
 }

@@ -2449,7 +2449,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .unwrap_or_else(|| target_table_ref.clone());
         let target_schema = Arc::new(DFSchema::try_from_qualified_schema(
-            target_qualifier,
+            target_qualifier.clone(),
             &target_table_source.schema(),
         )?);
 
@@ -2483,14 +2483,47 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // 6. Build the DmlStatement
+        // 6. Build the merge operation. When the target table carries an
+        // alias, rewrite alias-qualified column references to the canonical
+        // table reference: only the table reference is recorded in the plan,
+        // so downstream passes (analysis, physical planning) could not
+        // otherwise resolve alias-qualified target columns.
+        let mut merge_op = MergeIntoOp {
+            on: on_expr,
+            clauses: df_clauses,
+        };
+        if target_qualifier != target_table_ref {
+            use datafusion_common::tree_node::{Transformed, TreeNode};
+            let exprs = merge_op
+                .exprs()
+                .into_iter()
+                .cloned()
+                .map(|expr| {
+                    expr.transform(|e| match e {
+                        Expr::Column(Column {
+                            relation: Some(relation),
+                            name,
+                            spans,
+                        }) if relation == target_qualifier => {
+                            Ok(Transformed::yes(Expr::Column(Column {
+                                relation: Some(target_table_ref.clone()),
+                                name,
+                                spans,
+                            })))
+                        }
+                        other => Ok(Transformed::no(other)),
+                    })
+                    .map(|t| t.data)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            merge_op = merge_op.with_new_exprs(exprs)?;
+        }
+
+        // 7. Build the DmlStatement
         Ok(LogicalPlan::Dml(DmlStatement::new(
             target_table_ref,
             target_table_source,
-            WriteOp::MergeInto(Box::new(MergeIntoOp {
-                on: on_expr,
-                clauses: df_clauses,
-            })),
+            WriteOp::MergeInto(Box::new(merge_op)),
             Arc::new(source_plan),
         )))
     }

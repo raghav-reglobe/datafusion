@@ -58,7 +58,7 @@ use datafusion_expr::type_coercion::{
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
     Cast, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator, Projection, Union,
-    ValueOrLambda, WindowFrame, WindowFrameBound, WindowFrameUnits, is_false,
+    ValueOrLambda, WindowFrame, WindowFrameBound, WindowFrameUnits, WriteOp, is_false,
     is_not_false, is_not_true, is_not_unknown, is_true, is_unknown, lit, not,
 };
 
@@ -126,6 +126,20 @@ fn analyze_internal(
             &ts.source.schema(),
         )?;
         schema.merge(&source_schema);
+    }
+
+    // MERGE INTO expressions (ON condition, WHEN clause predicates and
+    // actions) reference target-table columns, but the Dml node's only input
+    // is the planned USING source. Merge the target table's schema, qualified
+    // by the target table name, so those references resolve.
+    if let LogicalPlan::Dml(dml) = &plan
+        && matches!(dml.op, WriteOp::MergeInto(_))
+    {
+        let target_schema = DFSchema::try_from_qualified_schema(
+            dml.table_name.clone(),
+            &dml.target.schema(),
+        )?;
+        schema.merge(&target_schema);
     }
 
     // merge the outer schema for correlated subqueries
