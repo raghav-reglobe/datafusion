@@ -2425,7 +2425,9 @@ impl NestedLoopJoinStream {
     /// true -> continue in the same EmitLeftUnmatched state
     /// false -> next state (Done)
     fn process_left_unmatched(&mut self) -> Result<bool> {
-        let left_data = self.get_left_data()?;
+        // Clone the shared `Arc<JoinLeftData>` so the immutable borrow of `self`
+        // ends here and we can update `self.probe_completed_reported` below.
+        let left_data = Arc::clone(self.get_left_data()?);
         let left_batch = left_data.batch();
 
         // ========
@@ -2453,7 +2455,7 @@ impl NestedLoopJoinStream {
         let end_idx = std::cmp::min(start_idx + self.batch_size, left_batch.num_rows());
 
         if let Some(batch) =
-            self.process_left_unmatched_range(left_data, start_idx, end_idx)?
+            self.process_left_unmatched_range(&left_data, start_idx, end_idx)?
         {
             self.output_buffer.push_batch(batch)?;
         }
