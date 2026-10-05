@@ -52,7 +52,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::utils::transpose;
 use datafusion_common::{
-    ColumnStatistics, DataFusionError, HashMap, assert_or_internal_err, internal_err,
+    ColumnStatistics, DataFusionError, HashMap, HashSet, assert_or_internal_err,
+    internal_err,
 };
 use datafusion_common::{Result, not_impl_err};
 use datafusion_common_runtime::SpawnedTask;
@@ -354,6 +355,83 @@ impl Debug for RepartitionExecState {
                 write!(f, "ConsumingInputStreams({v:?})")
             }
         }
+    }
+}
+
+/// State shared between a [`RepartitionExec`] node and the streams of its output
+/// partitions.
+#[derive(Debug, Default)]
+struct RepartitionExecShared {
+    /// Lifecycle of the input streams and of the channels to the output partitions.
+    state: RepartitionExecState,
+    /// Output partitions whose stream was dropped before its first poll while the
+    /// input streams were not being consumed yet. Their channels are closed as soon
+    /// as they are created, see [`UnpolledPartitionGuard`].
+    abandoned: HashSet<usize>,
+}
+
+/// Closes an output partition whose stream is dropped before its first poll.
+///
+/// The stream of an output partition takes its end of the channel on its first
+/// poll. A consumer that decides it does not need the partition after all (for
+/// example a join whose build side turned out to be empty) drops the stream
+/// without ever polling it. Without this guard the receiving end would stay
+/// inside the shared state for the lifetime of the node: the channel would never
+/// be read, yet stay open, so the input tasks would keep buffering every batch
+/// routed to it (in memory, then in spill files) for as long as any other output
+/// partition is being read.
+///
+/// The guard lives inside the not-yet-polled stream. If it is dropped while
+/// still armed it drops the partition's channels, which closes them: the input
+/// tasks then stop producing for that partition, exactly as they do when a
+/// stream is dropped after it has been polled. As in that case, the partition
+/// cannot be executed again once its channels are gone; while the input
+/// streams are not being consumed yet, a new stream for the partition simply
+/// takes it over.
+struct UnpolledPartitionGuard {
+    shared: Arc<Mutex<RepartitionExecShared>>,
+    partition: usize,
+    armed: bool,
+}
+
+impl UnpolledPartitionGuard {
+    fn new(shared: Arc<Mutex<RepartitionExecShared>>, partition: usize) -> Self {
+        Self {
+            shared,
+            partition,
+            armed: true,
+        }
+    }
+
+    /// The stream has taken over the partition's channels; from here on dropping
+    /// the stream closes them.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnpolledPartitionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Take the channels out under the lock, drop them after releasing it.
+        let channels = {
+            let mut shared = self.shared.lock();
+            let RepartitionExecShared { state, abandoned } = &mut *shared;
+            match state {
+                RepartitionExecState::ConsumingInputStreams(consuming) => {
+                    consuming.channels.remove(&self.partition)
+                }
+                _ => {
+                    // The channels do not exist yet; remember to close them when
+                    // they are created.
+                    abandoned.insert(self.partition);
+                    None
+                }
+            }
+        };
+        drop(channels);
     }
 }
 
@@ -1040,7 +1118,7 @@ pub struct RepartitionExec {
     input: Arc<dyn ExecutionPlan>,
     /// Inner state that is initialized when the parent calls .execute() on this node
     /// and consumed as soon as the parent starts consuming this node.
-    state: Arc<Mutex<RepartitionExecState>>,
+    state: Arc<Mutex<RepartitionExecShared>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Boolean flag to decide whether to preserve ordering. If true means
@@ -1245,8 +1323,8 @@ impl ExecutionPlan for RepartitionExec {
         let sort_exprs = self.sort_exprs().cloned();
 
         let state = Arc::clone(&self.state);
-        if let Some(mut state) = state.try_lock() {
-            state.ensure_input_streams_initialized(
+        if let Some(mut shared) = state.try_lock() {
+            shared.state.ensure_input_streams_initialized(
                 &input,
                 &metrics,
                 partitioning.partition_count(),
@@ -1254,13 +1332,21 @@ impl ExecutionPlan for RepartitionExec {
             )?;
         }
 
+        // Closes this partition's channels if the stream below is dropped before
+        // its first poll. A stream created for a partition that an earlier,
+        // never-polled stream gave up on takes the partition over again.
+        state.lock().abandoned.remove(&partition);
+        let mut unpolled_guard =
+            UnpolledPartitionGuard::new(Arc::clone(&state), partition);
+
         let num_input_partitions = input.output_partitioning().partition_count();
 
         let stream = futures::stream::once(async move {
             // lock scope
             let (rx, reservation, spill_readers, abort_helper) = {
                 // lock mutexes
-                let mut state = state.lock();
+                let mut shared = state.lock();
+                let RepartitionExecShared { state, abandoned } = &mut *shared;
                 let state = state.consume_input_streams(
                     &input,
                     &metrics,
@@ -1271,24 +1357,34 @@ impl ExecutionPlan for RepartitionExec {
                     spill_manager.clone(),
                 )?;
 
+                // Close the channels of the output partitions whose stream was
+                // dropped before the channels existed.
+                let abandoned_channels = abandoned
+                    .drain()
+                    .filter_map(|dropped| state.channels.remove(&dropped))
+                    .collect::<Vec<_>>();
+
                 // now return stream for the specified *output* partition which will
                 // read from the channel
-                let PartitionChannels {
+                let Some(PartitionChannels {
                     rx,
                     reservation,
                     spill_readers,
                     ..
-                } = state
-                    .channels
-                    .remove(&partition)
-                    .expect("partition not used yet");
+                }) = state.channels.remove(&partition)
+                else {
+                    return internal_err!(
+                        "{name}: output partition {partition} was already executed"
+                    );
+                };
+                unpolled_guard.disarm();
+                let abort_helper = Arc::clone(&state.abort_helper);
 
-                (
-                    rx,
-                    reservation,
-                    spill_readers,
-                    Arc::clone(&state.abort_helper),
-                )
+                // Release the lock before the abandoned channels are dropped.
+                drop(shared);
+                drop(abandoned_channels);
+
+                (rx, reservation, spill_readers, abort_helper)
             };
 
             trace!(
@@ -2485,6 +2581,82 @@ mod tests {
         | goo              |
         +------------------+
         ");
+    }
+
+    /// Round-robins 50 batches into two output partitions on an unbounded pool,
+    /// with a batch size that lets every batch through on its own.
+    fn two_way_round_robin() -> Result<(Arc<RepartitionExec>, Arc<TaskContext>)> {
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(8)),
+        );
+        let input =
+            TestMemoryExec::try_new_exec(&[create_vec_batches(50)], test_schema(), None)?;
+        let exec = Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(2),
+        )?);
+        Ok((exec, task_ctx))
+    }
+
+    /// An output stream that is dropped before its first poll is never read, so
+    /// nothing may be buffered for it while the other partitions are consumed.
+    #[tokio::test]
+    async fn unpolled_dropped_output_stream_is_not_buffered_for() -> Result<()> {
+        let (exec, task_ctx) = two_way_round_robin()?;
+
+        let kept = exec.execute(0, Arc::clone(&task_ctx))?;
+        let dropped = exec.execute(1, Arc::clone(&task_ctx))?;
+        // dropped before the input streams started to be consumed
+        drop(dropped);
+
+        let batches = crate::common::collect(kept).await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 25 * 8);
+
+        // The node is still alive: whatever it holds for partition 1 is held
+        // for nobody.
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    /// Same as above, but the stream is dropped after another partition's first
+    /// poll started the input tasks, i.e. while its channel already exists.
+    #[tokio::test]
+    async fn unpolled_output_stream_dropped_while_consuming_is_released() -> Result<()> {
+        let (exec, task_ctx) = two_way_round_robin()?;
+
+        let mut kept = exec.execute(0, Arc::clone(&task_ctx))?;
+        let dropped = exec.execute(1, Arc::clone(&task_ctx))?;
+        let mut rows = kept.next().await.expect("a first batch")?.num_rows();
+        drop(dropped);
+
+        while let Some(batch) = kept.next().await {
+            rows += batch?.num_rows();
+        }
+        assert_eq!(rows, 25 * 8);
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    /// A stream created for a partition that an earlier, never-polled stream gave
+    /// up on takes the partition over, as long as no output has been polled yet.
+    #[tokio::test]
+    async fn output_partition_is_usable_after_an_unpolled_drop() -> Result<()> {
+        let (exec, task_ctx) = two_way_round_robin()?;
+
+        drop(exec.execute(1, Arc::clone(&task_ctx))?);
+        let streams = (0..2)
+            .map(|partition| exec.execute(partition, Arc::clone(&task_ctx)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut rows = 0;
+        for stream in streams {
+            for batch in crate::common::collect(stream).await? {
+                rows += batch.num_rows();
+            }
+        }
+        assert_eq!(rows, 50 * 8);
+        assert_eq!(task_ctx.memory_pool().reserved(), 0);
+        Ok(())
     }
 
     #[tokio::test]
