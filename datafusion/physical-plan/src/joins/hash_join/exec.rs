@@ -5115,6 +5115,54 @@ mod tests {
         }
     }
 
+    /// When an empty build side alone decides that the join produces nothing, the
+    /// probe side is never read. The join must let go of it at once, not when its
+    /// own stream is dropped: until then the probe side's producers would keep
+    /// working for a reader that never comes.
+    #[tokio::test]
+    async fn join_releases_probe_when_empty_build_fixes_output() -> Result<()> {
+        use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
+        use futures::StreamExt;
+
+        for join_type in [
+            JoinType::Inner,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::RightSemi,
+        ] {
+            let left_batch =
+                build_table_i32(("a1", &vec![]), ("b1", &vec![]), ("c1", &vec![]));
+            let left_schema = left_batch.schema();
+            let left: Arc<dyn ExecutionPlan> = TestMemoryExec::try_new_exec(
+                &[vec![left_batch]],
+                Arc::clone(&left_schema),
+                None,
+            )?;
+            let right_schema =
+                build_table_i32(("a2", &vec![]), ("b1", &vec![]), ("c2", &vec![]))
+                    .schema();
+            // A probe side that never yields and counts who still holds it
+            let right = Arc::new(BlockingExec::new(Arc::clone(&right_schema), 1));
+            let probe_refs = right.refs();
+            let on = vec![(
+                Arc::new(Column::new_with_schema("b1", &left_schema)?) as _,
+                Arc::new(Column::new_with_schema("b1", &right_schema)?) as _,
+            )];
+
+            let join =
+                join(left, right, on, &join_type, NullEquality::NullEqualsNothing)?;
+            let mut stream = join.execute(0, Arc::new(TaskContext::default()))?;
+            // Only the stream keeps the probe side alive from here on.
+            drop(join);
+
+            assert!(stream.next().await.is_none(), "{join_type}: empty output");
+            // The join's stream is still alive, the probe side must not be.
+            assert_strong_count_converges_to_zero(probe_refs).await;
+            drop(stream);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn join_does_not_consume_probe_when_empty_build_fixes_output() {
         assert_empty_build_probe_behavior(

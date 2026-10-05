@@ -628,7 +628,25 @@ impl HashJoinStream {
         let build_side = self.build_side.try_as_ready()?;
         self.state =
             Self::state_after_build_ready(self.join_type, build_side.left_data.as_ref());
+        self.release_probe_side_if_completed();
         Poll::Ready(Ok(StatefulStreamResult::Continue))
+    }
+
+    /// Releases the probe-side input pipeline's resources. The schema is
+    /// preserved so callers that still query `self.right.schema()` (e.g. for
+    /// unmatched-build emission) keep working.
+    fn release_probe_side(&mut self) {
+        let right_schema = self.right.schema();
+        self.right = Box::pin(EmptyRecordBatchStream::new(right_schema));
+    }
+
+    /// Releases the probe side when the build side alone decided that the join
+    /// produces nothing: the probe side is then never read, and holding on to it
+    /// until this stream is dropped would keep its producers alive for no reader.
+    fn release_probe_side_if_completed(&mut self) {
+        if matches!(self.state, HashJoinStreamState::Completed) {
+            self.release_probe_side();
+        }
     }
 
     /// Collects build-side data by polling `OnceFut` future from initialized build-side
@@ -653,6 +671,7 @@ impl HashJoinStream {
         // The probe_side_has_null flag will be set there if any probe batch contains NULL.
 
         self.state = self.transition_after_build_collected(&left_data);
+        self.release_probe_side_if_completed();
 
         self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
         Poll::Ready(Ok(StatefulStreamResult::Continue))
@@ -668,11 +687,7 @@ impl HashJoinStream {
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         match ready!(self.right.poll_next_unpin(cx)) {
             None => {
-                // Release the probe-side input pipeline's resources. The schema
-                // is preserved so callers that still query `self.right.schema()`
-                // (e.g. for unmatched-build emission) keep working.
-                let right_schema = self.right.schema();
-                self.right = Box::pin(EmptyRecordBatchStream::new(right_schema));
+                self.release_probe_side();
                 self.state = HashJoinStreamState::ExhaustedProbeSide;
             }
             Some(Ok(batch)) => {
